@@ -3288,6 +3288,10 @@ std::string Verifier::profile_report() {
     }
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
+    // the windows that took the fused router: the proof that the flag reached the measured window
+    std::snprintf(b, sizeof b, " | fused router windows: %lld", (long long) fused_router_windows_);
+    out += b;
+    fused_router_windows_ = 0;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;

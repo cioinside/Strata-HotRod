@@ -780,6 +780,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (pf_cs_) cudaStreamSynchronize(pf_cs_);
     for (auto& row : exec_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
@@ -811,6 +812,7 @@ Verifier::~Verifier() {
     if (slot_hist_d_) cudaFree(slot_hist_d_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (pf_cs_) cudaStreamDestroy(pf_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (side2_) cudaStreamDestroy(side2_);
@@ -822,6 +824,8 @@ Verifier::~Verifier() {
     if (prof_pin_) cudaFreeHost(prof_pin_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
+    if (ev_pf_fork_) cudaEventDestroy(ev_pf_fork_);
+    if (ev_pf_join_) cudaEventDestroy(ev_pf_join_);
     for (cudaStream_t s : df_side_)
         if (s) cudaStreamDestroy(s);
     if (df_fork_) cudaEventDestroy(df_fork_);
@@ -1360,6 +1364,24 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
+    }
+    {   // STRATA_PCIE_EARLY=1 (opt-in): the PCIe share's fetch kernel runs on its own stream beside the VRAM groups, so the
+        // copy overlaps them instead of following them.  Off by default: it changes the experts' delivery path.  On any failure
+        // it stays off (pf_cs_ nullptr) and the fetch stays on the window's stream.
+        const char* v = std::getenv("STRATA_PCIE_EARLY");
+        if (v != nullptr && v[0] == '1') {
+            if (make_stream(&pf_cs_, gp_mid) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ev_pf_fork_, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ev_pf_join_, cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                if (pf_cs_) { cudaStreamDestroy(pf_cs_); pf_cs_ = nullptr; }
+                if (ev_pf_fork_) { cudaEventDestroy(ev_pf_fork_); ev_pf_fork_ = nullptr; }
+                if (ev_pf_join_) { cudaEventDestroy(ev_pf_join_); ev_pf_join_ = nullptr; }
+                std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the side stream could not be made, the PCIe fetch stays on the window's stream\n");
+            } else {
+                std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the PCIe share's fetch overlaps the VRAM experts (own stream, pcie mode 2)\n");
+            }
+        }
     }
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
         // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
@@ -2876,16 +2898,33 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
             stamp(l, 19, grp);
+            // STRATA_PCIE_EARLY: the PCIe share's fetch starts on pf_cs_ as soon as the plan is on the device and the host
+            // has published the share (flag B), while cs runs the VRAM groups; the join below makes the PCIe groups wait for
+            // it.  The staging region is this group's, reused only by the same group of the next layer, whose fork comes after
+            // this layer's PCIe groups on cs.
+            const bool pf_early = pf_cs_ != nullptr && sink_.pcie_mode == 2 && !device_plan_ && !prof_on_;
+            const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
+            if (pf_early) {
+                cudaEventRecord(ev_pf_fork_, cs);
+                cudaStreamWaitEvent(pf_cs_, ev_pf_fork_, 0);
+                wait_flag_ge(m_flagB_, ring, pf_cs_);
+                const int64_t per_e = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage_e = staging_ + (size_t) (grp * per_e) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage_e, (int64_t) lay.blob_bytes(l), (int) per_e, pf_cs_, p_dst2);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage_e, (int64_t) lay.blob_bytes(l), pf_cs_, p_dst2);
+                cudaEventRecord(ev_pf_join_, pf_cs_);
+            }
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+            if (pf_early) {
+                cudaStreamWaitEvent(cs, ev_pf_join_, 0);           // STRATA_PCIE_EARLY: the fetch ran beside the VRAM groups
+            } else if (sink_.pcie_mode == 2) {                    // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs, p_dst2);
             }

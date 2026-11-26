@@ -22,6 +22,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -31,9 +32,24 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "strata/kernels/f16_bits.hpp"
 
 namespace strata::core {
+
+/// the pid of this process (the state file's temporary name must not be shared by two processes)
+inline unsigned long la_own_pid() {
+#ifdef _WIN32
+    return (unsigned long) _getpid();
+#else
+    return (unsigned long) getpid();
+#endif
+}
 
 /// The training cadence (the fork's docs/SPEC-adaptive-la.md, change 2; its include/strata/kernels/la_cadence.hpp,
 /// ported as it is): a live (layer, distance) trains every event, a frozen one every 4 -> 8 -> 16 events (the
@@ -203,6 +219,18 @@ public:
         return slot_[slot_of(target, dist)].lead != 0;
     }
 
+    /// Does this (target, distance) still need the correction?  A frozen slot whose leader is the plain router can
+    /// never change (the contest and the drop test are off for it), so the correction is not built for it: the
+    /// cadence back-off of the fork ("no work where there is nothing to learn").
+    bool needs_corr(int64_t target, int dist) const {
+        if (!on_ || dist < 1 || dist > kMaxDist || target < 0 || target >= n_layers_) return false;
+        const Slot& s = slot_[slot_of(target, dist)];
+        return !(s.frozen && s.lead == 0);
+    }
+
+    /// the number of the training steps (the test watches it)
+    unsigned long long trained_count() const { return trained_; }
+
     /// The top-k of the plain router and of the learned correction (per token), the caller has them: the hit rates
     /// the leader contest runs on.
     void set_top(int64_t target, int dist, const int32_t* top_plain, const int32_t* top_learn, int n_tok) {
@@ -218,6 +246,7 @@ public:
     void set_label(int64_t target, uint64_t stamp, const int32_t* ids, int n_tok, int k, const int32_t* host_res) {
         if (!on_ || target < 0 || target >= n_layers_ || n_tok < 1) return;
         std::lock_guard<std::mutex> lk(mu_);
+        if (host_res != nullptr) has_res_ = true;   // the labels carry the cache's residency: the learner scores the misses
         Label& l = label_[(size_t) target];
         l.ids.assign(ids, ids + (size_t) n_tok * (size_t) k);
         l.pick.assign((size_t) n_tok * (size_t) k, 0);
@@ -276,6 +305,8 @@ public:
         std::snprintf(buf, sizeof buf, "%llu events, %llu trained, %llu leader changes, %llu resets", (unsigned long long) events_,
                       (unsigned long long) trained_, (unsigned long long) changes_, (unsigned long long) resets_);
         s += buf;
+        // the objective: with the cache's residency the learner scores the misses, without it the whole routing
+        s += has_res_ ? "; mode: the misses' recall" : "; mode: the routing recall (no residency table)";
         return s;
     }
 
@@ -293,11 +324,27 @@ public:
                   (int64_t) hdr.n_embd == n_embd_ && (int64_t) hdr.n_expert == n_expert_ && (int) hdr.rank == rank_ &&
                   (int) hdr.k == k_ && hdr.n_dist == (uint32_t) kMaxDist;
         const size_t n = (size_t) (n_layers_ * kMaxDist);
+        const size_t na = (size_t) rank_ * (size_t) n_embd_, nb = (size_t) n_expert_ * (size_t) rank_;
+        // the headers go into temporaries: the slots change only after the whole file is read (a truncated file must
+        // not leave a half-loaded state behind)
         std::vector<Meta> meta(n);
         if (ok) ok = std::fread(meta.data(), sizeof(Meta), meta.size(), f) == meta.size();
-        std::vector<uint16_t> buf;
-        const size_t na = (size_t) rank_ * (size_t) n_embd_, nb = (size_t) n_expert_ * (size_t) rank_;
-        for (size_t i = 0; ok && i < n; ++i) {
+        size_t leads = 0;
+        for (size_t i = 0; ok && i < n; ++i)
+            if (meta[i].lead != 0) ++leads;
+        std::vector<uint16_t> all;
+        if (ok) {
+            all.assign(leads * (na + nb), 0);
+            ok = std::fread(all.data(), sizeof(uint16_t), all.size(), f) == all.size();
+        }
+        std::fclose(f);
+        if (!ok) {
+            msg = "not a SAL1 file of this model";
+            return false;
+        }
+        // the file is whole: the slots take the state now
+        size_t off = 0;
+        for (size_t i = 0; i < n; ++i) {
             Slot& s = slot_[i];
             s.lead = (int) meta[i].lead;
             s.picks = meta[i].picks;
@@ -305,23 +352,16 @@ public:
             s.hits_learn = meta[i].hits_learn;
             s.step = (int) meta[i].step;
             if (s.lead == 0) continue;   // the plain router: no correction to load
-            buf.assign(na + nb, 0);
-            ok = std::fread(buf.data(), sizeof(uint16_t), buf.size(), f) == buf.size();
-            if (!ok) break;
-            for (size_t j = 0; j < na; ++j) A_[i * na + j] = strata::kernels::f32_from_f16(buf[j]);
-            for (size_t j = 0; j < nb; ++j) B_[i * nb + j] = strata::kernels::f32_from_f16(buf[na + j]);
-        }
-        std::fclose(f);
-        if (!ok) {
-            msg = "not a SAL1 file of this model";
-            return false;
+            for (size_t j = 0; j < na; ++j) A_[i * na + j] = strata::kernels::f32_from_f16(all[off + j]);
+            for (size_t j = 0; j < nb; ++j) B_[i * nb + j] = strata::kernels::f32_from_f16(all[off + na + j]);
+            off += na + nb;
         }
         msg = "loaded";
         return true;
     }
 
     bool save(const std::string& path, std::string& msg) {
-        const std::string tmp = path + ".tmp";
+        const std::string tmp = path + ".tmp" + std::to_string(la_own_pid());
         FILE* f = std::fopen(tmp.c_str(), "wb");
         if (f == nullptr) {
             msg = "cannot write " + tmp;
@@ -441,7 +481,10 @@ private:
     /// a reset of the learned slot: A random, B and the moments zero (the fork's la_b_reinit_k)
     void reset_slot(size_t sl) {
         const size_t na = (size_t) rank_ * (size_t) n_embd_, nb = (size_t) n_expert_ * (size_t) rank_;
-        uint64_t key = (uint64_t) sl * 0x100000001b3ull + 0x9E3779B97F4A7C15ull;
+        // the counter of the resets is in the key: a rollback does not re-use the projector of the slot it
+        // replaced (the fork counts the resets too)
+        uint64_t key = (uint64_t) sl * 0x100000001b3ull + (uint64_t) resets_ * 0x9E3779B97F4A7C15ull +
+                      0x9E3779B97F4A7C15ull;
         for (size_t j = 0; j < na; ++j) A_[sl * na + j] = rand_pm(key);
         std::memset(B_.data() + sl * nb, 0, nb * sizeof(float));
         std::memset(mA_.data() + sl * na, 0, na * sizeof(float));
@@ -607,7 +650,6 @@ private:
                 const bool is_truth = std::find(truth.begin(), truth.end(), e) != truth.end();
                 const float g = probs[i] - (is_truth ? y : 0.0f);
                 if (g == 0.0f) continue;
-                float* be = b + (size_t) e * (size_t) rank_;
                 for (int q = 0; q < rank_; ++q) gb[(size_t) e * (size_t) rank_ + (size_t) q] += g * uu[q];
             }
             // the gradient of A: (sum over the candidates of g * B[e][q]) * x[h]
@@ -633,6 +675,7 @@ private:
     }
 
     bool on_ = false;
+    std::atomic<bool> has_res_{false};   // the labels carried the cache's residency at least once
     int64_t n_layers_ = 0, n_embd_ = 0, n_expert_ = 0;
     int rank_ = 8, k_ = 10;
     uint64_t model_key_ = 0;

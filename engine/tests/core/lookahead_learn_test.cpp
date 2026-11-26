@@ -115,6 +115,102 @@ void test_leader_and_training() {
     CHECK(in_learn == true);
 }
 
+// a label of another window does not train the slot
+void test_stamp_mismatch() {
+    constexpr int kLayers = 2, kEmb = 8, kExpert = 4, kRank = 2, kK = 2, kTok = 2;
+    LookaheadLearner lr;
+    std::string err;
+    CHECK(lr.start(kLayers, kEmb, kExpert, kRank, kK, err));
+    std::vector<float> plain((size_t) kTok * kExpert, 0.0f), x((size_t) kTok * kEmb, 0.0f), out(plain.size(), 0.0f);
+    std::vector<int32_t> tp((size_t) kTok * kK, 0), tl((size_t) kTok * kK, 0), ids((size_t) kTok * kK, 0);
+    std::vector<int32_t> res((size_t) kLayers * kExpert, -1);
+    lr.correct(1, 1, x.data(), kTok, 100, plain.data(), out.data());
+    lr.set_top(1, 1, tp.data(), tl.data(), kTok);
+    // the label of another window: the slot is not trained on it
+    lr.set_label(1, 101, ids.data(), kTok, kK, res.data());
+    lr.train_pending();
+    CHECK(lr.trained_count() == 0);
+    // the label of its own window trains it
+    lr.set_label(1, 100, ids.data(), kTok, kK, res.data());
+    lr.train_pending();
+    CHECK(lr.trained_count() == 1);
+}
+
+// the plain router takes the lead back when it wins two recent blocks in a row
+void test_lead_back() {
+    constexpr int kLayers = 2, kEmb = 8, kExpert = 4, kRank = 2, kK = 2, kTok = 4;
+    LookaheadLearner lr;
+    std::string err;
+    CHECK(lr.start(kLayers, kEmb, kExpert, kRank, kK, err));
+    std::vector<float> plain((size_t) kTok * kExpert, 0.0f);
+    for (int t = 0; t < kTok; ++t)
+        for (int e = 0; e < kExpert; ++e) plain[(size_t) t * kExpert + e] = 0.03f * (float) e;
+    std::vector<float> x((size_t) kTok * kEmb, 0.0f);
+    for (int t = 0; t < kTok; ++t) x[(size_t) t * kEmb] = 1.0f;
+    std::vector<int32_t> ids((size_t) kTok * kK, 0);
+    std::vector<int32_t> res((size_t) kLayers * kExpert, -1);
+    res[1 * kExpert + 1] = 0;   // expert 1 of layer 1 is resident: only the other routed expert is worth predicting
+    std::vector<int32_t> tp, tl;
+    std::vector<float> out((size_t) kTok * kExpert, 0.0f);
+    bool led = false, back = false;
+    for (int ev = 0; ev < 1200 && !back; ++ev) {
+        const uint64_t stamp = (uint64_t) (ev + 1);
+        for (int t = 0; t < kTok; ++t) ids[(size_t) t * kK] = 0, ids[(size_t) t * kK + 1] = 1;
+        if (led) {
+            // the routing moves to the expert the plain router holds and the correction does not: from now on the
+            // plain router wins the recent blocks
+            bool plain_has = false, learn_has = false;
+            for (int z = 0; z < kK; ++z) {
+                if (tp[z] == 3) plain_has = true;
+                if (tl[z] == 3) learn_has = true;
+            }
+            if (plain_has && !learn_has)
+                for (int t = 0; t < kTok; ++t) ids[(size_t) t * kK] = 3, ids[(size_t) t * kK + 1] = 1;
+        }
+        lr.correct(1, 1, x.data(), kTok, stamp, plain.data(), out.data());
+        top_k(plain, kExpert, kTok, kK, tp);
+        top_k(out, kExpert, kTok, kK, tl);
+        lr.set_top(1, 1, tp.data(), tl.data(), kTok);
+        lr.set_label(1, stamp, ids.data(), kTok, kK, res.data());
+        lr.train_pending();
+        if (!led && lr.leads(1, 1)) led = true;
+        if (led && !lr.leads(1, 1)) back = true;
+    }
+    CHECK(led);      // the correction won the lead
+    CHECK(back);     // and the plain router took it back
+}
+
+// a frozen slot whose leader is the plain router needs no correction (the cadence back-off)
+void test_frozen_plain_slot() {
+    constexpr int kLayers = 2, kEmb = 8, kExpert = 4, kRank = 2, kK = 2, kTok = 4;
+    LookaheadLearner lr;
+    std::string err;
+    CHECK(lr.start(kLayers, kEmb, kExpert, kRank, kK, err));
+    // the plain router holds the routed experts, so the correction never wins the lead
+    std::vector<float> plain((size_t) kTok * kExpert, 0.0f);
+    for (int t = 0; t < kTok; ++t)
+        for (int e = 0; e < kExpert; ++e) plain[(size_t) t * kExpert + e] = 0.03f * (float) e;
+    std::vector<float> x((size_t) kTok * kEmb, 0.0f);
+    for (int t = 0; t < kTok; ++t) x[(size_t) t * kEmb] = 1.0f;
+    std::vector<int32_t> ids((size_t) kTok * kK, 0);
+    std::vector<int32_t> res((size_t) kLayers * kExpert, -1);
+    std::vector<int32_t> tp, tl;
+    std::vector<float> out((size_t) kTok * kExpert, 0.0f);
+    for (int ev = 0; ev < 700; ++ev) {
+        const uint64_t stamp = (uint64_t) (ev + 1);
+        for (int t = 0; t < kTok; ++t) ids[(size_t) t * kK] = 3, ids[(size_t) t * kK + 1] = 2;
+        lr.correct(1, 1, x.data(), kTok, stamp, plain.data(), out.data());
+        top_k(plain, kExpert, kTok, kK, tp);
+        top_k(out, kExpert, kTok, kK, tl);
+        lr.set_top(1, 1, tp.data(), tl.data(), kTok);
+        lr.set_label(1, stamp, ids.data(), kTok, kK, res.data());
+        lr.train_pending();
+        if (ev == 100) CHECK(lr.needs_corr(1, 1));   // not frozen yet
+    }
+    CHECK(lr.leads(1, 1) == false);        // the plain router kept the lead
+    CHECK(lr.needs_corr(1, 1) == false);   // the slot froze: no correction and no work
+}
+
 // the state file: a round trip, and a file of another model's geometry is refused
 void test_state_file() {
     constexpr int kLayers = 3, kEmb = 8, kExpert = 4, kRank = 2, kK = 2, kTok = 2;
@@ -123,7 +219,7 @@ void test_state_file() {
     CHECK(lr.start(kLayers, kEmb, kExpert, kRank, kK, err));
     std::vector<float> plain((size_t) kTok * kExpert, 0.0f), x((size_t) kTok * kEmb, 0.0f), out(plain.size(), 0.0f);
     std::vector<int32_t> tp((size_t) kTok * kK, 0), tl((size_t) kTok * kK, 0), ids((size_t) kTok * kK, 0);
-    std::vector<int32_t> res((size_t) kExpert, -1);
+    std::vector<int32_t> res((size_t) kLayers * kExpert, -1);   // the table of the whole model
     lr.correct(2, 1, x.data(), kTok, 1, plain.data(), out.data());
     lr.set_top(2, 1, tp.data(), tl.data(), kTok);
     lr.set_label(2, 1, ids.data(), kTok, kK, res.data());
@@ -149,6 +245,9 @@ void test_state_file() {
 int main() {
     test_cadence();
     test_leader_and_training();
+    test_stamp_mismatch();
+    test_lead_back();
+    test_frozen_plain_slot();
     test_state_file();
     std::printf("lookahead_learn_test: ok\n");
     return 0;

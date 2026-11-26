@@ -3547,17 +3547,25 @@ bool RouterLookahead::set_learn_file(const std::string& path, std::string& msg) 
         msg = "the look-ahead learner is off";
         return false;
     }
-    learn_file_ = path;
+    if (path.empty()) {   // no state file: the learner keeps its state in RAM only
+        learn_file_.clear();
+        msg = "no state file";
+        return true;
+    }
     std::string m;
     if (learn_->load(path, m)) {
+        learn_file_ = path;
         msg = "loaded " + path;
         return true;
     }
     if (m == "no file") {
+        learn_file_ = path;
         msg = "no state file yet (" + path + ")";
         return true;
     }
-    msg = m + " (" + path + ")";
+    // a file of another model (or a damaged one): the learner must not write over it
+    learn_file_.clear();
+    msg = m + " (" + path + ") - the learner will not write it";
     return false;
 }
 
@@ -3719,6 +3727,10 @@ void RouterLookahead::run() {
     std::vector<int32_t> order((size_t) n_expert_);
     std::vector<int64_t> want;
     std::vector<float> wconf;   // 149-prefetch: per wanted expert, its best rank's confidence (warm_scored)
+    // STRATA_LA_LEARN: the corrected logits and their top k (the plain router's top k is `order`); the buffers are
+    // filled once and only when the learner is on, so the path without it pays nothing
+    std::vector<float> corr;
+    std::vector<int32_t> order2, ltp, ltl;
     for (;;) {
         int64_t layer, nt;
         const int32_t* host_res;   // res_: layer_'s row first (submit leaves it alone while busy_)
@@ -3745,10 +3757,13 @@ void RouterLookahead::run() {
         const auto t0 = std::chrono::steady_clock::now();
         const int64_t layer0 = layer;
         const int depth = src_ != nullptr && !src_->read_ahead_open() ? 1 : depth_;   // 149: the gate closed
-        // STRATA_LA_LEARN: the corrected logits and their top k (the plain router's top k is `order`)
-        std::vector<float> corr((size_t) (8 * n_expert_));
-        std::vector<int32_t> order2((size_t) n_expert_);
-        std::vector<int32_t> ltp((size_t) (8 * k_)), ltl((size_t) (8 * k_));
+        const bool learn_on = learn_ != nullptr;
+        if (learn_on && corr.empty()) {   // STRATA_LA_LEARN: the buffers of the learner, once
+            corr.assign((size_t) (8 * n_expert_), 0.0f);
+            order2.assign((size_t) n_expert_, 0);
+            ltp.assign((size_t) (8 * k_), 0);
+            ltl.assign((size_t) (8 * k_), 0);
+        }
         for (int dj = 0; dj < depth && layer0 + dj < (int64_t) routers_.size(); ++dj) {
         layer = layer0 + dj;
         want.clear();
@@ -3792,9 +3807,14 @@ void RouterLookahead::run() {
         const int ks[3] = {k_, (int) std::min<int64_t>(k_ + 4, n_expert_), kmax};
         std::vector<uint64_t> sm;
         if (stats_on_) sm.assign((size_t) (3 * words_), 0);
-        if (learn_ != nullptr) {
-            // the learned correction: the plain router's logits plus the learned term (the leader decides whether it is used)
+        // STRATA_LA_LEARN: the learned correction (the plain router's logits plus the learned term; the leader
+        // decides whether it is used).  A frozen slot whose leader is the plain router can never change, so the
+        // correction is not built for it: the cadence back-off of the fork (no work where there is nothing to learn).
+        bool corr_ok = false, lead = false;
+        if (learn_on && learn_->needs_corr(layer, dj + 1)) {
             learn_->correct(layer, dj + 1, work_x_.data(), (int) nt, sgen + 1, logits.data(), corr.data());
+            lead = learn_->leads(layer, dj + 1);
+            corr_ok = true;
         }
         for (int64_t t = 0; t < nt; ++t) {
             const float* lp = logits.data() + (size_t) (t * n_expert_);
@@ -3802,7 +3822,7 @@ void RouterLookahead::run() {
             std::partial_sort(order.begin(), order.begin() + kmax, order.end(),
                               [&](int32_t a, int32_t b) { return lp[(size_t) a] > lp[(size_t) b]; });
             const int32_t* top = order.data();
-            if (learn_ != nullptr) {
+            if (corr_ok) {
                 // the correction's top k: the learner scores its own slot against the plain router's
                 const float* lc = corr.data() + (size_t) (t * n_expert_);
                 for (int64_t e = 0; e < n_expert_; ++e) order2[(size_t) e] = (int32_t) e;
@@ -3812,7 +3832,7 @@ void RouterLookahead::run() {
                     ltp[(size_t) (t * k_ + j)] = order[(size_t) j];
                     ltl[(size_t) (t * k_ + j)] = order2[(size_t) j];
                 }
-                if (learn_->leads(layer, dj + 1)) top = order2.data();
+                if (lead) top = order2.data();
             }
             for (int j = 0; j < kmax; ++j) {
                 const int64_t e = top[j];
@@ -3830,7 +3850,7 @@ void RouterLookahead::run() {
                         if (j < ks[s]) sm[(size_t) (s * words_ + (e >> 6))] |= 1ull << (e & 63);
             }
         }
-        if (learn_ != nullptr) learn_->set_top(layer, dj + 1, ltp.data(), ltl.data(), (int) nt);
+        if (corr_ok) learn_->set_top(layer, dj + 1, ltp.data(), ltl.data(), (int) nt);
         if (stats_on_ && dj == 0) {
             // votes: how many tokens put each non-resident expert in their top k_
             std::vector<std::pair<int, int32_t>> votes;   // (sum of 64 - rank, expert)

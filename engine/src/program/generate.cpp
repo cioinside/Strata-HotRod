@@ -10494,9 +10494,13 @@ int main(int argc, char** argv) {
                 std::string lerr, lmsg;
                 if (lookahead.enable_learn(g.n_layers, g.n_expert, 8, ckpt_model_key(o, g), lerr)) {
                     const char* lf = std::getenv("STRATA_LA_LEARN_FILE");
-                    if (lf != nullptr && lf[0] != '\0') lookahead.set_learn_file(lf, lmsg);
+                    const std::string lpath = lf ? std::string(lf) : std::string();
+                    const bool lfile_ok = lookahead.set_learn_file(lpath, lmsg);
                     std::fprintf(stderr, "strata generate: the look-ahead learner is on (a rank-8 correction, the state file: %s)\n",
-                                 (lf != nullptr && lf[0] != '\0') ? lmsg.c_str() : "none (STRATA_LA_LEARN_FILE=<path>)");
+                                 lpath.empty() ? "none (STRATA_LA_LEARN_FILE=<path>)" : lmsg.c_str());
+                    if (!lfile_ok)
+                        std::fprintf(stderr, "strata lookahead: the state file %s is not ours - the learner keeps its state in RAM only\n",
+                                 lpath.c_str());
                 } else {
                     std::fprintf(stderr, "strata generate: the look-ahead learner stays off (%s)\n", lerr.c_str());
                 }

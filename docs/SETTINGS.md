@@ -153,7 +153,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_L3_PF` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_L3_PF_TOP` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_LA_LEARN` | number | NVIDIA and AMD | - |
-| `STRATA_LA_LEARN_FILE` | on / off | NVIDIA and AMD | - |
+| `STRATA_LA_LEARN_FILE` | text | NVIDIA and AMD | - |
 | `STRATA_LEND_MIRROR` | text | Intel Arc | [INTEL.md](INTEL.md), [INTEL_ARC.md](INTEL_ARC.md) |
 | `STRATA_LM_HIP` | on / off | AMD | - |
 | `STRATA_LOGITS_DUMP` | on / off | NVIDIA and AMD, Intel Arc | [KVA.md](KVA.md) |

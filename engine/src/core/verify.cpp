@@ -2672,6 +2672,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                    bf16_gemv_fp32_mmvf_multi_fused(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
                                                                      logits_ + tb * NE, NE, N, NE, n,
                                                                      ids_ + tb * K, w_ + tb * K, router_cnt_, cs);
+                if (fused) ++fused_router_windows_;   // the windows that took the fused router (the stage table prints it)
                 if (!fused) {
                     if (w_sgi != nullptr)
                         sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
@@ -3231,6 +3232,9 @@ std::string Verifier::profile_by_t_report() {
     }
     std::memset(prof_t_sum_, 0, sizeof prof_t_sum_);
     std::memset(prof_t_win_, 0, sizeof prof_t_win_);
+    std::snprintf(b, sizeof b, "fused router windows: %lld\n", (long long) fused_router_windows_);
+    out += b;
+    fused_router_windows_ = 0;   // the count is per request, like the table's sums
     return out;
 }
 

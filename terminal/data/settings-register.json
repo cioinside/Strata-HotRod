@@ -20959,6 +20959,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_LA_LEARN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 10471,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "program",
+   "note": "The learned look-ahead (the port of the fork's la_learn_*): a learned low-rank correction of the predicted logits, learned from the routing the layers really make. Off by default: it changes which experts the prefetch asks for.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_LA_LEARN_FILE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 10496,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "program",
+   "note": "The state file of the learned look-ahead (the model's key and the geometry in its header; a file of another model is refused). Without it the learner keeps its state in RAM only.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_LEND_MIRROR",
    "backends": [
     "sycl"
@@ -29303,6 +29369,39 @@
    "status": "research",
    "owner": "program",
    "note": "[reviewed] Slower on a single card; multi-card tuning switch. [docs/DETAILS.md:1308]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PCIE_EARLY",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/verify.cpp",
+     "line": 1371,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "core",
+   "note": "The PCIe share's fetch on its own stream (the port of the fork's idea). Off by default: it changes the experts' delivery path.",
    "retire_after": "",
    "retired_in": ""
   },

@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (338)
+## Switches you can turn on (341)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -152,6 +152,8 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_KV_ROT` | on / off | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md), [SPLIT_SERVE.md](SPLIT_SERVE.md) |
 | `STRATA_L3_PF` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_L3_PF_TOP` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
+| `STRATA_LA_LEARN` | number | NVIDIA and AMD | - |
+| `STRATA_LA_LEARN_FILE` | on / off | NVIDIA and AMD | - |
 | `STRATA_LEND_MIRROR` | text | Intel Arc | [INTEL.md](INTEL.md), [INTEL_ARC.md](INTEL_ARC.md) |
 | `STRATA_LM_HIP` | on / off | AMD | - |
 | `STRATA_LOGITS_DUMP` | on / off | NVIDIA and AMD, Intel Arc | [KVA.md](KVA.md) |
@@ -200,6 +202,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PATTN_SM60` | number | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
 | `STRATA_PA_V2T` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PCIE_AUTO_CANON` | on / off | NVIDIA and AMD | - |
+| `STRATA_PCIE_EARLY` | on / off | NVIDIA and AMD | - |
 | `STRATA_PCIE_FRAC_DEFAULT` | on / off | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [DETAILS.md](DETAILS.md), [README.md](bench-results/2026-10-20-0.2.1-idle-gpu/README.md) |
 | `STRATA_PCIE_K_RULE` | text | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PCIE_MIN1` | number | NVIDIA and AMD | [README.md](bench-results/2026-10-11-community-rtx3090-5600x-arena-pin-by-need/README.md) |

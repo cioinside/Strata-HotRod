@@ -4,6 +4,7 @@
 #include "s26_tsum.cuh"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/pdl.hpp"
+#include "strata/kernels/router_top10.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -113,9 +114,10 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
 // the same kernel for up to 8 activation rows - the weight row is read ONCE and every
 // token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
 // and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
-template <int BLOCK_SIZE, int NT, bool EXACT_T = true>
+template <int BLOCK_SIZE, int NT, bool EXACT_T = true, bool FUSED = false>
 __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const uint16_t* __restrict__ w,
-                                          float* y_, int64_t ldy, int n_in, int n_tok, int fast) {
+                                          float* y_, int64_t ldy, int n_in, int n_tok, int fast,
+                                          int32_t* ids, float* weights, unsigned* counter) {
     const float* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     float* STRATA_PDL_RESTRICT y = y_;
     const int t = threadIdx.x;
@@ -212,6 +214,26 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const u
 #pragma unroll
         for (int k = 0; k < NT; ++k)
             if (EXACT_T || k < n_tok) y[(size_t) k * ldy + blockIdx.x] = acc[k];
+    if constexpr (FUSED) {
+        // STRATA_ROUTER_FUSE=1: the selection in the same launch.  The block that finishes last does it (the
+        // "last block" idiom of fused_gr.cu's q8_1 tail): every block counts into the caller's counter, and the one
+        // whose count closes the grid picks the top-10 of the rows the other blocks wrote (a block counts only after
+        // its own write is fenced, so the last count means every row is there).  The counter only counts (it is never
+        // reset), so every launch that shares it must have the same grid size: 512 blocks, one expert each.
+        __shared__ int last;
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const unsigned ticket = atomicAdd(counter, 1u);
+            last = (ticket % gridDim.x) == (gridDim.x - 1);
+        }
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+        const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+        if (warp >= n_tok) return;
+        router_top10_row<true>(y_ + (size_t) warp * ldy, ids + (size_t) warp * 10, weights + (size_t) warp * 10, lane);
+    }
 }
 
 // S25 (STRATA_MMVF_ROWS=1): RPB output rows per block. Each block read its row's weights once but all T activation
@@ -410,6 +432,49 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
     return true;
 }
 
+// the multi GEMV's launches: the plain path and the fused node (the tail) are the same kernels, the fused ones
+// carry the selection's rows and the counter.
+template <bool FUSED>
+static void mmvf_multi_dispatch(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                int64_t n_in, int64_t n_out, int n_tok, cudaStream_t st,
+                                int32_t* ids, float* weights, unsigned* counter) {
+    // 9..16 rows (wide builds only): one exact instantiation per row count, each row's dot independent of the others.  7 and 8
+    // rows stay with the default case below, the instantiation they always had.
+#if STRATA_VERIFY_MAX_T > 8
+#define STRATA_MMVF_W(N, T) case T: launch_pdl(bf16_f32_mmvf_multi_kernel<N, T, true, FUSED>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), ids, weights, counter); break;
+#if STRATA_VERIFY_MAX_T > 12
+#define STRATA_MMVF_W13(N) STRATA_MMVF_W(N, 13) STRATA_MMVF_W(N, 14) STRATA_MMVF_W(N, 15) STRATA_MMVF_W(N, 16)
+#else
+#define STRATA_MMVF_W13(N)
+#endif
+#define STRATA_MMVF_WIDE(N) \
+        STRATA_MMVF_W(N, 9) STRATA_MMVF_W(N, 10) STRATA_MMVF_W(N, 11) STRATA_MMVF_W(N, 12) \
+        STRATA_MMVF_W13(N)
+#else
+#define STRATA_MMVF_WIDE(N)
+#endif
+#define STRATA_MMVF_M(N) case N: \
+    switch (n_tok) { \
+        STRATA_MMVF_WIDE(N) \
+        case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, true, FUSED>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), ids, weights, counter); break; \
+        case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, true, FUSED>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), ids, weights, counter); break; \
+        case 3: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 3, true, FUSED>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), ids, weights, counter); break; \
+        case 4: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4, true, FUSED>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), ids, weights, counter); break; \
+        case 5: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 5, true, FUSED>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), ids, weights, counter); break; \
+        case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, true, FUSED>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), ids, weights, counter); break; \
+        default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, false, FUSED>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), ids, weights, counter); break; \
+    } break
+    switch (mmvf_block_size(n_in)) {
+        STRATA_MMVF_M(32); STRATA_MMVF_M(64); STRATA_MMVF_M(96); STRATA_MMVF_M(128);
+        STRATA_MMVF_M(160); STRATA_MMVF_M(192); STRATA_MMVF_M(224); STRATA_MMVF_M(256);
+    }
+#undef STRATA_MMVF_M
+#undef STRATA_MMVF_WIDE
+#ifdef STRATA_MMVF_W
+#undef STRATA_MMVF_W
+#endif
+}
+
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
@@ -435,44 +500,36 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
         return;
     }
-    // 9..16 rows (wide builds only): one exact instantiation per row count, each row's dot independent of the others.  7 and 8
-    // rows stay with the default case below, the instantiation they always had.
-#if STRATA_VERIFY_MAX_T > 8
-#define STRATA_MMVF_W(N, T) case T: launch_pdl(bf16_f32_mmvf_multi_kernel<N, T, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break;
-#if STRATA_VERIFY_MAX_T > 12
-#define STRATA_MMVF_W13(N) STRATA_MMVF_W(N, 13) STRATA_MMVF_W(N, 14) STRATA_MMVF_W(N, 15) STRATA_MMVF_W(N, 16)
-#else
-#define STRATA_MMVF_W13(N)
-#endif
-#define STRATA_MMVF_WIDE(N) \
-        STRATA_MMVF_W(N, 9) STRATA_MMVF_W(N, 10) STRATA_MMVF_W(N, 11) STRATA_MMVF_W(N, 12) \
-        STRATA_MMVF_W13(N)
-#else
-#define STRATA_MMVF_WIDE(N)
-#endif
-#define STRATA_MMVF_M(N) case N: \
-    switch (n_tok) { \
-        STRATA_MMVF_WIDE(N) \
-        case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 3: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 3, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 4: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 5: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 5, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, false>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-    } break
-    switch (mmvf_block_size(n_in)) {
-        STRATA_MMVF_M(32); STRATA_MMVF_M(64); STRATA_MMVF_M(96); STRATA_MMVF_M(128);
-        STRATA_MMVF_M(160); STRATA_MMVF_M(192); STRATA_MMVF_M(224); STRATA_MMVF_M(256);
-    }
-#undef STRATA_MMVF_M
-#undef STRATA_MMVF_WIDE
-#ifdef STRATA_MMVF_W
-#undef STRATA_MMVF_W
-#endif
+    mmvf_multi_dispatch<false>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, nullptr, nullptr, nullptr);
     const cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess)
         throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
+}
+
+// STRATA_ROUTER_FUSE=1: the BF16 GEMV and the top-10 in ONE launch - the window's router is one node, not two.
+// `counter` is a device uint32 the caller owns: the blocks count into it and the block that finishes last picks
+// the top-10 of the rows the other blocks wrote (the "last block" idiom of fused_gr.cu's q8_1 tail).  Every
+// launch that shares a counter must have the same grid size (the count is what says which block is last).
+// Returns false (nothing launched) unless the plain multi path applies and the block size gives every token a
+// warp of its own; the caller then runs the two launches as before.
+bool bf16_gemv_fp32_mmvf_multi_fused(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                     int64_t n_in, int64_t n_out, int n_tok, int32_t* ids, float* weights,
+                                     unsigned* counter, void* stream) {
+    // the selection is the 512-expert top-10 (the router's shape), and the grid must be the same for every launch that
+    // shares the counter (it is what says which block is last): 512 blocks, one expert each.
+    if (n_out != 512 || n_tok < 2 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 ||
+        x == nullptr || w == nullptr || y == nullptr || ids == nullptr || weights == nullptr || counter == nullptr ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
+        return false;
+    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+    if (rows) return false;   // the rows path is not fused
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (mmvf_block_size(n_in) < 32 * n_tok) return false;   // every token needs a warp of its own in the tail
+    mmvf_multi_dispatch<true>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, ids, weights, counter);
+    const cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess)
+        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi_fused launch: ") + cudaGetErrorString(result));
+    return true;
 }
 
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,

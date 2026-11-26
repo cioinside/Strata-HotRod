@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/router_top10.cuh"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cfloat>
@@ -101,52 +102,7 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
                             float* __restrict__ weights, int n_tok) {
     const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
     if (tk >= n_tok) return;
-    logits += (size_t) tk * 512; ids += (size_t) tk * 10; weights += (size_t) tk * 10;
-    const int lane = threadIdx.x;
-    float values[16];
-#pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
-    __syncwarp();
-    float maximum = -INFINITY;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
-    maximum = warp_max(maximum);
-    float sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        values[i] = expf(values[i] - maximum);
-        sum += values[i];
-    }
-    const float reciprocal = 1.0f / warp_sum(sum);
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        values[i] *= reciprocal;
-        if (__isnanf(values[i])) values[i] = -FLT_MAX;
-    }
-    float selected = 0.0f, selected_sum = 0.0f;
-    for (int rank = 0; rank < 10; ++rank) {
-        float best = values[0];
-        int expert = lane;
-#pragma unroll
-        for (int i = 1; i < 16; ++i) {
-            if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
-        }
-#pragma unroll
-        for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
-            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
-        }
-        if ((expert & 31) == lane) {
-            values[expert / 32] = -INFINITY;
-            ids[rank] = expert;
-            selected_sum += best;
-        }
-        if (rank == lane) selected = best;
-    }
-    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
-    const float inverse_selected_sum = 1.0f / selected_sum;
-    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+    router_top10_row(logits + (size_t) tk * 512, ids + (size_t) tk * 10, weights + (size_t) tk * 10, (int) threadIdx.x);
 }
 // The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
 // (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used

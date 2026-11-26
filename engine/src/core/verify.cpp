@@ -123,6 +123,9 @@ using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
+// STRATA_ROUTER_FUSE=1 (opt-in): the router's GEMV and its top-10 in one launch (the fork's idea in our shape).  Off by
+// default: the router is in the hot path, so it changes only with its own review and its own A/B.
+inline bool g_router_fuse() { static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
 RouteResidentCfg& route_resident_cfg();
@@ -1213,6 +1216,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
+        // STRATA_ROUTER_FUSE: the fused router launch's counter (the blocks count into it, the last one picks the top-10).
+        // One per verifier: every fused launch of a verifier is on its own stream, so the launches never overlap.
+        router_cnt_ = b.take<unsigned>(1);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
@@ -2657,14 +2663,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool sg_ready = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
-                if (w_sgi != nullptr)
-                    sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
-                                                             logits_ + tb * NE, NE, N, NE, n,
-                                                             (const uint16_t*) w_sgi->data, sh_g_ + tb, 1, cs);
-                if (!sg_ready)
-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
-                                          NE, n, cs);
-                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                // STRATA_ROUTER_FUSE=1 (opt-in): the router's GEMV and its top-10 in ONE launch - the window's router is
+                // one node, not two (the fork's idea in our shape).  The selection rides in the GEMV's tail: the block that
+                // finishes last picks the top-10 of the rows the other blocks wrote (the "last block" idiom of fused_gr.cu's
+                // q8_1 tail).  The ids and weights are the two launches' own, bit for bit (router_fuse_parity).
+                // Not with the shared expert's gate row (STRATA_LFUSE=1): that row has its own launch, so it keeps the two.
+                const bool fused = g_router_fuse() && w_sgi == nullptr && router_cnt_ != nullptr &&
+                                   bf16_gemv_fp32_mmvf_multi_fused(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
+                                                                     logits_ + tb * NE, NE, N, NE, n,
+                                                                     ids_ + tb * K, w_ + tb * K, router_cnt_, cs);
+                if (!fused) {
+                    if (w_sgi != nullptr)
+                        sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
+                                                                 logits_ + tb * NE, NE, N, NE, n,
+                                                                 (const uint16_t*) w_sgi->data, sh_g_ + tb, 1, cs);
+                    if (!sg_ready)
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
+                                              NE, n, cs);
+                    native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                }
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else if (dec_batch && route_window_on()) {
             // a router the native one does not take (it is 512 x 10 only: the Coder's 256 experts) for the whole

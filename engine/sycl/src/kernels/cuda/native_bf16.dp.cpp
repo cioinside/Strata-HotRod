@@ -579,6 +579,10 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
     return true;
 }
 
+bool bf16_gemv_fp32_mmvf_multi_fused(const float*, int64_t, const uint16_t*, float*, int64_t, int64_t, int64_t, int,
+                                     int32_t*, float*, unsigned*, void*) {
+    return false;   // the SYCL backend keeps the two launches (the fused node is CUDA's)
+}
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }

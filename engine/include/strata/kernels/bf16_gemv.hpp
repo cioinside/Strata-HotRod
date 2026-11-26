@@ -66,5 +66,15 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream);
+/// STRATA_ROUTER_FUSE=1: the BF16 GEMV and the router's top-10 in ONE launch - the window's router is one node,
+/// not two.  `ids` / `weights` are the rows the selection writes (n_tok x 10, the router's contract);
+/// `counter` is a device uint32 the caller owns: the blocks count into it and the block that finishes last
+/// picks the top-10 of the rows the other blocks wrote.  Every launch that shares a counter must have the same
+/// grid size (the count is what says which block is last).  Returns false (nothing launched) unless the shape is
+/// the router's (512 experts, 2-8 rows), the plain multi path applies and the block size gives every token a
+/// warp of its own.
+bool bf16_gemv_fp32_mmvf_multi_fused(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                     int64_t n_in, int64_t n_out, int n_tok, int32_t* ids, float* weights,
+                                     unsigned* counter, void* stream);
 
 }  // namespace strata::kernels

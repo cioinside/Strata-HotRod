@@ -8,6 +8,7 @@
 //     output, k = 9 and a null shared row take the scalar one) against a host replay of the documented contract:
 //     the first product rounds to F32, the next ones accumulate with FMA in expert order, the shared row is added
 //     once: memcmp.
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -45,6 +46,13 @@ std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
     check(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "d2h");
     return h;
+}
+
+// a finite BF16 (the top half of the float's bits: the mantissa loses its last bit, the value stays in range)
+uint16_t bf16_of(float f) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &f, 4);
+    return (uint16_t) (bits >> 16);
 }
 
 }  // namespace
@@ -91,6 +99,62 @@ int main(int argc, char**) {
         std::printf("  %-52s %s (%d cases)\n", (std::string("router multi == single, ") + names[mode]).c_str(),
                     mode_bad ? "*** NO ***" : "bitwise", cases);
         bad += mode_bad;
+    }
+
+    // ---- STRATA_ROUTER_FUSE: the router's GEMV and its top-10 in ONE launch are the two launches' own, bit for bit
+    // (the router is in the hot path: a different pick is a different answer, so this is compared with memcmp)
+    {
+        const int NE = 512, K = 10;
+        int fuse_bad = 0, cases = 0;
+        for (int n_in : {2560, 4096}) {
+            for (int n = 2; n <= 8; ++n) {
+                std::vector<uint16_t> hw((size_t) NE * n_in);
+                for (auto& v : hw) v = bf16_of(gauss(rng) * 0.5f);
+                std::vector<float> hx((size_t) n * n_in);
+                for (auto& v : hx) v = gauss(rng);
+                uint16_t* d_w = up(hw);
+                float* d_x = up(hx);
+                float *d_l = nullptr, *d_l2 = nullptr, *d_wt = nullptr, *d_wt2 = nullptr;
+                int32_t *d_i = nullptr, *d_i2 = nullptr;
+                check(cudaMalloc(&d_l, (size_t) n * NE * 4), "l");
+                check(cudaMalloc(&d_l2, (size_t) n * NE * 4), "l2");
+                check(cudaMalloc(&d_i, (size_t) n * K * 4), "i");
+                check(cudaMalloc(&d_i2, (size_t) n * K * 4), "i2");
+                check(cudaMalloc(&d_wt, (size_t) n * K * 4), "wt");
+                check(cudaMalloc(&d_wt2, (size_t) n * K * 4), "wt2");
+                unsigned* d_cnt = nullptr;
+                check(cudaMalloc(&d_cnt, 4), "cnt");
+                check(cudaMemset(d_cnt, 0, 4), "cnt0");
+                // the two launches: the router GEMV, then the top-10
+                bf16_gemv_fp32_mmvf_multi(d_x, n_in, d_w, d_l, NE, n_in, NE, n, st);
+                native_router_top10_multi(d_l, d_i, d_wt, n, st);
+                // the one launch: the same GEMV with the selection in its tail
+                const bool applied = bf16_gemv_fp32_mmvf_multi_fused(d_x, n_in, d_w, d_l2, NE, n_in, NE, n, d_i2, d_wt2,
+                                                                    d_cnt, st);
+                check(cudaDeviceSynchronize(), "sync");
+                ++cases;
+                const auto i1 = down(d_i, (size_t) n * K), i2 = down(d_i2, (size_t) n * K);
+                const auto w1 = down(d_wt, (size_t) n * K), w2 = down(d_wt2, (size_t) n * K);
+                if (!applied) {
+                    std::printf("    *** the fused router launch did not apply (n_in=%d n=%d) ***\n", n_in, n);
+                    ++fuse_bad;
+                } else if (std::memcmp(i1.data(), i2.data(), i1.size() * 4) != 0 ||
+                           std::memcmp(w1.data(), w2.data(), w1.size() * 4) != 0) {
+                    std::printf("    *** the fused router differs from the two launches (n_in=%d n=%d) ***\n", n_in, n);
+                    ++fuse_bad;
+                }
+                // the guard: a shape the selection does not cover (not 512 experts) is not launched at all
+                if (bf16_gemv_fp32_mmvf_multi_fused(d_x, n_in, d_w, d_l2, NE, n_in, 256, n, d_i2, d_wt2, d_cnt, st)) {
+                    std::printf("    *** the fused router took a 256-expert shape ***\n");
+                    ++fuse_bad;
+                }
+                cudaFree(d_w); cudaFree(d_x); cudaFree(d_l); cudaFree(d_l2);
+                cudaFree(d_i); cudaFree(d_i2); cudaFree(d_wt); cudaFree(d_wt2); cudaFree(d_cnt);
+            }
+        }
+        std::printf("  %-52s %s (%d cases)\n", "fused router == the GEMV + the top-10",
+                    fuse_bad ? "*** NO ***" : "bitwise", cases);
+        bad += fuse_bad;
     }
 
     // ---- #1357: a model that does not have 512 experts takes the generic router (the native one reads 512 floats a

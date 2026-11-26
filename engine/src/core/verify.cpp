@@ -3205,9 +3205,10 @@ std::string Verifier::profile_by_t_report() {
     if (!prof_on_) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
-                                          "attention", "gate", "", "out-proj", "router+plan", "shared+quant",
+                                          "attention", "gate", "", "out-proj", "plan+bell", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up"};
+                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up",
+                                          "router (proj+topk)"};   // the same names as profile_report(): 17 is the plan+bell, 33 the router
     std::string out;
     char b[96];
     for (int T = 1; T <= 16; ++T) {

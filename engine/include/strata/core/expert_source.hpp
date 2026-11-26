@@ -25,6 +25,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
+#include "strata/core/lookahead_learn.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <algorithm>
@@ -345,6 +346,15 @@ public:
     /// STRATA_LOOKAHEAD_STATS=1 (measurement only): remember each prediction (top k, k+4 and k+10 per token) and let the
     /// dispatch score it against the experts the next layer really routes outside the GPU cache.
     void enable_stats(int64_t n_layers);
+    /// STRATA_LA_LEARN=1 (opt-in): the learned look-ahead.  The learner corrects the predicted logits with a learned
+    /// low-rank term and learns it from the routing the layer really made; it falls back to the plain router when the
+    /// correction does not win (the Newcombe test on the hit rates) and backs off when there is nothing to learn.
+    bool enable_learn(int64_t n_layers, int64_t n_expert, int rank, uint64_t model_key, std::string& err);
+    bool learn_on() const { return learn_ != nullptr; }
+    /// the state file of the learner (the model's key in its header, the geometry too)
+    bool set_learn_file(const std::string& path, std::string& msg);
+    /// the label of a layer: the experts it really routed (the dispatch thread)
+    void learn_score(int64_t layer, const int32_t* ids, int n_tok, int k, const int32_t* host_res);
     bool stats_on() const { return stats_on_; }
     void stats_window_start() { gen_.fetch_add(1, std::memory_order_relaxed); }
     void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0);
@@ -373,6 +383,10 @@ private:
     std::vector<float> work_x_;      ///< worker's active copy while busy_ == true
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
+    // STRATA_LA_LEARN: the learner and its state file
+    LookaheadLearner* learn_ = nullptr;
+    std::string learn_file_;
+    uint64_t learn_save_tick_ = 0, learn_report_tick_ = 0;
     // STRATA_LOOKAHEAD_STATS
     bool stats_on_ = false;
     int64_t words_ = 0;

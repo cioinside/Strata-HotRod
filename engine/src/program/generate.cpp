@@ -10465,6 +10465,10 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
+    // STRATA_LA_LEARN=1 (opt-in): the learned look-ahead (the port of the fork's la_learn_*): the predicted logits get
+    // a learned low-rank correction, learned from the routing the layers really make.  Off by default: it changes
+    // which experts the prefetch asks for, so it stays off until it has its own review and an A/B of its own.
+    const bool la_learn = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LA_LEARN"); return v != nullptr && std::atoi(v) != 0; }();
     if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
         (la_env == nullptr || std::atoi(la_env) != 0)) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
@@ -10486,6 +10490,17 @@ int main(int argc, char** argv) {
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats)) {
             drive.d.lookahead = &lookahead;
             if (la_stats) lookahead.enable_stats(g.n_layers);
+            if (la_learn) {   // the learned look-ahead (the correction of rank 8)
+                std::string lerr, lmsg;
+                if (lookahead.enable_learn(g.n_layers, g.n_expert, 8, ckpt_model_key(o, g), lerr)) {
+                    const char* lf = std::getenv("STRATA_LA_LEARN_FILE");
+                    if (lf != nullptr && lf[0] != '\0') lookahead.set_learn_file(lf, lmsg);
+                    std::fprintf(stderr, "strata generate: the look-ahead learner is on (a rank-8 correction, the state file: %s)\n",
+                                 (lf != nullptr && lf[0] != '\0') ? lmsg.c_str() : "none (STRATA_LA_LEARN_FILE=<path>)");
+                } else {
+                    std::fprintf(stderr, "strata generate: the look-ahead learner stays off (%s)\n", lerr.c_str());
+                }
+            }
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
                 lookahead.set_depth(std::atoi(dv));
             else if (srcp == &src && (src.io_prefetch() || o.ssd_experts))

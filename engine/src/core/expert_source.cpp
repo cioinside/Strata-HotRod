@@ -3518,6 +3518,53 @@ RouterLookahead::~RouterLookahead() {
     }
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    if (learn_ != nullptr) {   // STRATA_LA_LEARN: the state file goes out with the learner
+        if (!learn_file_.empty()) {
+            std::string m;
+            if (!learn_->save(learn_file_, m)) std::fprintf(stderr, "strata lookahead: the learner could not write %s (%s)\n", learn_file_.c_str(), m.c_str());
+        }
+        delete learn_;
+        learn_ = nullptr;
+    }
+}
+
+// STRATA_LA_LEARN=1 (opt-in): the learned look-ahead.  The learner corrects the predicted logits with a learned
+// low-rank term (lookahead_learn.hpp) and learns it from the routing the layers really make; it falls back to the
+// plain router when the correction does not win and backs off when there is nothing to learn.
+bool RouterLookahead::enable_learn(int64_t n_layers, int64_t n_expert, int rank, uint64_t model_key, std::string& err) {
+    if (learn_ != nullptr) return true;
+    LookaheadLearner* lr = new LookaheadLearner();
+    if (!lr->start(n_layers, n_embd_, n_expert, rank, k_, err, model_key)) {
+        delete lr;
+        return false;
+    }
+    learn_ = lr;
+    return true;
+}
+
+bool RouterLookahead::set_learn_file(const std::string& path, std::string& msg) {
+    if (learn_ == nullptr) {
+        msg = "the look-ahead learner is off";
+        return false;
+    }
+    learn_file_ = path;
+    std::string m;
+    if (learn_->load(path, m)) {
+        msg = "loaded " + path;
+        return true;
+    }
+    if (m == "no file") {
+        msg = "no state file yet (" + path + ")";
+        return true;
+    }
+    msg = m + " (" + path + ")";
+    return false;
+}
+
+// the dispatch thread: the experts the layer really routed (the label the learner learns from)
+void RouterLookahead::learn_score(int64_t layer, const int32_t* ids, int n_tok, int k, const int32_t* host_res) {
+    if (learn_ == nullptr || layer < 0 || layer >= (int64_t) routers_.size() || n_tok < 1 || k < 1) return;
+    learn_->set_label(layer, gen_.load(std::memory_order_relaxed) + 1, ids, n_tok, k, host_res);
 }
 
 void RouterLookahead::set_foresight(ForesightSwap* fs) {
@@ -3698,6 +3745,10 @@ void RouterLookahead::run() {
         const auto t0 = std::chrono::steady_clock::now();
         const int64_t layer0 = layer;
         const int depth = src_ != nullptr && !src_->read_ahead_open() ? 1 : depth_;   // 149: the gate closed
+        // STRATA_LA_LEARN: the corrected logits and their top k (the plain router's top k is `order`)
+        std::vector<float> corr((size_t) (8 * n_expert_));
+        std::vector<int32_t> order2((size_t) n_expert_);
+        std::vector<int32_t> ltp((size_t) (8 * k_)), ltl((size_t) (8 * k_));
         for (int dj = 0; dj < depth && layer0 + dj < (int64_t) routers_.size(); ++dj) {
         layer = layer0 + dj;
         want.clear();
@@ -3741,13 +3792,30 @@ void RouterLookahead::run() {
         const int ks[3] = {k_, (int) std::min<int64_t>(k_ + 4, n_expert_), kmax};
         std::vector<uint64_t> sm;
         if (stats_on_) sm.assign((size_t) (3 * words_), 0);
+        if (learn_ != nullptr) {
+            // the learned correction: the plain router's logits plus the learned term (the leader decides whether it is used)
+            learn_->correct(layer, dj + 1, work_x_.data(), (int) nt, sgen + 1, logits.data(), corr.data());
+        }
         for (int64_t t = 0; t < nt; ++t) {
-            const float* lt = logits.data() + (size_t) (t * n_expert_);
+            const float* lp = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
             std::partial_sort(order.begin(), order.begin() + kmax, order.end(),
-                              [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
+                              [&](int32_t a, int32_t b) { return lp[(size_t) a] > lp[(size_t) b]; });
+            const int32_t* top = order.data();
+            if (learn_ != nullptr) {
+                // the correction's top k: the learner scores its own slot against the plain router's
+                const float* lc = corr.data() + (size_t) (t * n_expert_);
+                for (int64_t e = 0; e < n_expert_; ++e) order2[(size_t) e] = (int32_t) e;
+                std::partial_sort(order2.begin(), order2.begin() + kmax, order2.end(),
+                                  [&](int32_t a, int32_t b) { return lc[(size_t) a] > lc[(size_t) b]; });
+                for (int j = 0; j < k_; ++j) {
+                    ltp[(size_t) (t * k_ + j)] = order[(size_t) j];
+                    ltl[(size_t) (t * k_ + j)] = order2[(size_t) j];
+                }
+                if (learn_->leads(layer, dj + 1)) top = order2.data();
+            }
             for (int j = 0; j < kmax; ++j) {
-                const int64_t e = order[(size_t) j];
+                const int64_t e = top[j];
                 if (host_res != nullptr && host_res[(size_t) ((layer - layer0) * n_expert_ + e)] >= 0) continue;   // on the GPU
                 if (j < k_) {
                     const auto it = std::find(want.begin(), want.end(), e);
@@ -3762,6 +3830,7 @@ void RouterLookahead::run() {
                         if (j < ks[s]) sm[(size_t) (s * words_ + (e >> 6))] |= 1ull << (e & 63);
             }
         }
+        if (learn_ != nullptr) learn_->set_top(layer, dj + 1, ltp.data(), ltl.data(), (int) nt);
         if (stats_on_ && dj == 0) {
             // votes: how many tokens put each non-resident expert in their top k_
             std::vector<std::pair<int, int32_t>> votes;   // (sum of 64 - rank, expert)
@@ -3791,6 +3860,15 @@ void RouterLookahead::run() {
         if (fs != nullptr && dj == 0)   // the next layer only: a deeper guess is too often wrong to spend a copy on
             for (const int64_t e : want) fs->predict(src_, layer, (int32_t) e);
         predicted_.fetch_add((int64_t) want.size(), std::memory_order_relaxed);
+        }
+        if (learn_ != nullptr) {   // STRATA_LA_LEARN: the scoring, the leader contest and the training of the due slots
+            learn_->train_pending();
+            if (!learn_file_.empty() && (++learn_save_tick_ % 100000) == 0) {
+                std::string m;
+                if (!learn_->save(learn_file_, m)) std::fprintf(stderr, "strata lookahead: the learner could not write %s (%s)\n", learn_file_.c_str(), m.c_str());
+            }
+            if ((++learn_report_tick_ % 1000) == 0)
+                std::fprintf(stderr, "strata lookahead: %s\n", learn_->report().c_str());
         }
         busy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                            std::memory_order_relaxed);
@@ -5434,9 +5512,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (d.lookahead != nullptr) {
-        if (d.lookahead->stats_on()) {
+        if (d.lookahead->stats_on() || d.lookahead->learn_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
-            d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
+            if (d.lookahead->stats_on()) d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
+            if (d.lookahead->learn_on()) d.lookahead->learn_score(d.layers, ids, (int) n_tok, (int) k, d.host_res);
         }
         d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
     }

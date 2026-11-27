@@ -2667,7 +2667,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const bool native_multi = dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
             if (!said && (!native_multi || w_sgi != nullptr || router_cnt_ == nullptr)) {
                 said = true;
-                std::printf(stderr, "strata: the fused router did not apply: %s (n=%d NE=%lld K=%lld)\n",
+                std::fprintf(stderr, "strata: the fused router did not apply: %s (n=%d NE=%lld K=%lld)\n",
                             !native_multi ? "the router is not the native multi path" :
                             (w_sgi != nullptr ? "the shared expert's gate row rides in the router's launch" : "no counter"),
                             n, (long long) NE, (long long) K);

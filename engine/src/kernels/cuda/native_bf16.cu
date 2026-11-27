@@ -534,7 +534,7 @@ bool bf16_gemv_fp32_mmvf_multi_fused(const float* x, int64_t ldx, const uint16_t
         static bool said = false;
         if (!said) {
             said = true;
-            std::printf(stderr, "strata: the fused router did not apply: %s (n_tok=%d n_in=%lld block=%d)\n", why, n_tok,
+            std::fprintf(stderr, "strata: the fused router did not apply: %s (n_tok=%d n_in=%lld block=%d)\n", why, n_tok,
                         (long long) n_in, mmvf_block_size(n_in));
         }
         return false;

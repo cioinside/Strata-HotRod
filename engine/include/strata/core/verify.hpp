@@ -794,7 +794,10 @@ private:
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     unsigned* router_cnt_ = nullptr;                             // STRATA_ROUTER_FUSE: the fused router's counter
+    uint32_t router_cnt_prev_ = 0;                               // STRATA_ROUTER_FUSE: the counter's value at the last table
     int64_t fused_router_windows_ = 0;                           // STRATA_ROUTER_FUSE: the windows that took the fused router
+    int64_t fused_router_fail_ = 0;                           // STRATA_ROUTER_FUSE: the router calls that did not take it
+    const char* fused_router_why_ = nullptr;                   // STRATA_ROUTER_FUSE: why the last one did not (the table prints it)
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;

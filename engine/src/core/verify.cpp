@@ -2662,18 +2662,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         // STRATA_ROUTER_FUSE=1: why the fused router did not take this window (the port's instrument: the stage
         // table says how many windows took it; a window that did not must say why).  One line per process.
+        const char* fuse_why = nullptr;
         if (g_router_fuse()) {
             static bool said = false;
             const bool native_multi = dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
-            if (!said && (!native_multi || w_sgi != nullptr || router_cnt_ == nullptr)) {
+            // the reason, term by term: the stage table prints the last one (the port's instrument)
+            if (!native_multi) {
+                if (!dec_batch) fuse_why = "the decode batch mode is off";
+                else if (n <= 1) fuse_why = "the window has one row";
+                else if (w_router == nullptr) fuse_why = "the router's weight is missing";
+                else if (!native_router_enabled()) fuse_why = "the native router is off";
+                else if (NE != 512) fuse_why = "the router is not 512 experts";
+                else fuse_why = "the router is not top-10";
+            } else if (w_sgi != nullptr)
+                fuse_why = "the shared expert's gate row rides in the router's launch";
+            else if (router_cnt_ == nullptr)
+                fuse_why = "no counter";
+            if (!said && fuse_why != nullptr) {
                 said = true;
                 std::fprintf(stderr, "strata: the fused router did not apply: %s (n=%d NE=%lld K=%lld)\n",
-                            !native_multi ? "the router is not the native multi path" :
-                            (w_sgi != nullptr ? "the shared expert's gate row rides in the router's launch" : "no counter"),
+                            fuse_why,
                             n, (long long) NE, (long long) K);
             }
         }
         bool sg_ready = false;
+        bool fuse_taken = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 // STRATA_ROUTER_FUSE=1 (opt-in): the router's GEMV and its top-10 in ONE launch - the window's router is
@@ -2685,6 +2698,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                    bf16_gemv_fp32_mmvf_multi_fused(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
                                                                      logits_ + tb * NE, NE, N, NE, n,
                                                                      ids_ + tb * K, w_ + tb * K, router_cnt_, cs);
+                fuse_taken = fused;
                 if (fused) ++fused_router_windows_;   // the windows that took the fused router (the stage table prints it)
                 if (!fused) {
                     if (w_sgi != nullptr)
@@ -2711,6 +2725,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+        }
+        // the port's instrument: the router calls that did not take the fused router say why (the table prints it)
+        if (g_router_fuse() && !fuse_taken) {
+            ++fused_router_fail_;
+            fused_router_why_ = fuse_why ? fuse_why : "the fused launch did not apply";
         }
         stamp(l, 33, grp);   // the routing (projection + top-k) done; what follows in 17 is the plan / doorbell
         strata::dispatch::notef("router layer: batched native router=%ld, shared-expert gate in the router launch=%ld, route_prior=%ld", (long) (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10), (long) sg_ready, (long) (g_route_prior() > 0.0f));
@@ -3224,7 +3243,7 @@ std::string Verifier::profile_by_t_report() {
                                           "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up",
                                           "router (proj+topk)"};   // the same names as profile_report(): 17 is the plan+bell, 33 the router
     std::string out;
-    char b[96];
+    char b[192];
     for (int T = 1; T <= 16; ++T) {
         if (prof_t_win_[T] == 0) continue;
         double total = 0;
@@ -3245,9 +3264,21 @@ std::string Verifier::profile_by_t_report() {
     }
     std::memset(prof_t_sum_, 0, sizeof prof_t_sum_);
     std::memset(prof_t_win_, 0, sizeof prof_t_win_);
-    std::snprintf(b, sizeof b, "fused router windows: %lld\n", (long long) fused_router_windows_);
+    // the fused router's launches since the last table: the counter counts the blocks of every fused launch
+    // (512 of them: the grid is the router's shape), so the delta is the number of launches - the graph captures
+    // AND the replays.  The captures alone say nothing about the steady state: the window's graph is captured
+    // once and replayed after that.
+    uint32_t tickets = 0;
+    if (router_cnt_ != nullptr) cudaMemcpy(&tickets, router_cnt_, sizeof tickets, cudaMemcpyDeviceToHost);
+    const unsigned long long fused_launches = (uint32_t) (tickets - router_cnt_prev_) / 512u;
+    router_cnt_prev_ = tickets;
+    std::snprintf(b, sizeof b, "fused router captures: %lld | not taken: %lld (%s) | fused launches: %llu",
+             (long long) fused_router_windows_, (long long) fused_router_fail_,
+             fused_router_why_ ? fused_router_why_ : "none", fused_launches);
     out += b;
     fused_router_windows_ = 0;   // the count is per request, like the table's sums
+    fused_router_fail_ = 0;
+    fused_router_why_ = nullptr;
     return out;
 }
 
@@ -3288,7 +3319,7 @@ std::string Verifier::profile_report() {
                                           "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up",
                                           "router (proj+topk)"};
     std::string out;
-    char b[80];
+    char b[192];
     double total = 0;
     for (int k = 0; k < 2; ++k) {
         out += k == 0 ? " GDN layers:" : " | QSA layers:";
@@ -3302,9 +3333,21 @@ std::string Verifier::profile_report() {
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
     // the windows that took the fused router: the proof that the flag reached the measured window
-    std::snprintf(b, sizeof b, " | fused router windows: %lld", (long long) fused_router_windows_);
+    // the fused router's launches since the last table: the counter counts the blocks of every fused launch
+    // (512 of them: the grid is the router's shape), so the delta is the number of launches - the graph captures
+    // AND the replays.  The captures alone say nothing about the steady state: the window's graph is captured
+    // once and replayed after that.
+    uint32_t tickets = 0;
+    if (router_cnt_ != nullptr) cudaMemcpy(&tickets, router_cnt_, sizeof tickets, cudaMemcpyDeviceToHost);
+    const unsigned long long fused_launches = (uint32_t) (tickets - router_cnt_prev_) / 512u;
+    router_cnt_prev_ = tickets;
+    std::snprintf(b, sizeof b, "fused router captures: %lld | not taken: %lld (%s) | fused launches: %llu",
+             (long long) fused_router_windows_, (long long) fused_router_fail_,
+             fused_router_why_ ? fused_router_why_ : "none", fused_launches);
     out += b;
     fused_router_windows_ = 0;
+    fused_router_fail_ = 0;
+    fused_router_why_ = nullptr;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;

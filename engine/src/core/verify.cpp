@@ -2660,6 +2660,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+        // STRATA_ROUTER_FUSE=1: why the fused router did not take this window (the port's instrument: the stage
+        // table says how many windows took it; a window that did not must say why).  One line per process.
+        if (g_router_fuse()) {
+            static bool said = false;
+            const bool native_multi = dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
+            if (!said && (!native_multi || w_sgi != nullptr || router_cnt_ == nullptr)) {
+                said = true;
+                std::printf(stderr, "strata: the fused router did not apply: %s (n=%d NE=%lld K=%lld)\n",
+                            !native_multi ? "the router is not the native multi path" :
+                            (w_sgi != nullptr ? "the shared expert's gate row rides in the router's launch" : "no counter"),
+                            n, (long long) NE, (long long) K);
+            }
+        }
         bool sg_ready = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {

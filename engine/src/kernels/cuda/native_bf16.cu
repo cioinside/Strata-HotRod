@@ -517,14 +517,29 @@ bool bf16_gemv_fp32_mmvf_multi_fused(const float* x, int64_t ldx, const uint16_t
                                      unsigned* counter, void* stream) {
     // the selection is the 512-expert top-10 (the router's shape), and the grid must be the same for every launch that
     // shares the counter (it is what says which block is last): 512 blocks, one expert each.
-    if (n_out != 512 || n_tok < 2 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 ||
-        x == nullptr || w == nullptr || y == nullptr || ids == nullptr || weights == nullptr || counter == nullptr ||
-        (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
-        return false;
     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
-    if (rows) return false;   // the rows path is not fused
+    // why it did not apply: the port's instrument.  A window that took the fused router says so in the stage table
+    // ("fused router windows: N"); a window that did not must say why - one line per process.
+    const char* why = nullptr;
+    if (n_out != 512) why = "the router is not 512 experts";
+    else if (n_tok < 2) why = "the window has one row";
+    else if (n_tok > STRATA_VERIFY_MAX_T) why = "the window is wider than the kernel's limit";
+    else if (n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0) why = "the activation's shape is not even";
+    else if (x == nullptr || w == nullptr || y == nullptr || ids == nullptr || weights == nullptr || counter == nullptr)
+        why = "a pointer is null";
+    else if ((reinterpret_cast<uintptr_t>(x) & 7u) != 0) why = "the activation is not 8-byte aligned";
+    else if (rows) why = "the rows path is on";
+    else if (mmvf_block_size(n_in) < 32 * n_tok) why = "the block is too small for the window's rows";
+    if (why) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf(stderr, "strata: the fused router did not apply: %s (n_tok=%d n_in=%lld block=%d)\n", why, n_tok,
+                        (long long) n_in, mmvf_block_size(n_in));
+        }
+        return false;
+    }
     const cudaStream_t st = (cudaStream_t) stream;
-    if (mmvf_block_size(n_in) < 32 * n_tok) return false;   // every token needs a warp of its own in the tail
     mmvf_multi_dispatch<true>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, ids, weights, counter);
     const cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess)
